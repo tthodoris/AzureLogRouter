@@ -1,0 +1,12 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "AzureWebJobsStorage__accountName": "<storage-account>",
+    "ExportHub__fullyQualifiedNamespace": "<namespace>.servicebus.windows.net",
+    "ExportHubName": "central-logs",
+    "ExportConsumerGroup": "log-router",
+    "FailureStorageUri": "https://<storage-account>.blob.core.windows.net/quarantine",
+    "RoutingConfigPath": "routing.json"
+  }
+}

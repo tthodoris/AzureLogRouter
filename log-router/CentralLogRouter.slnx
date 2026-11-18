@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/LogRouter/LogRouter.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/LogRouter.Tests/LogRouter.Tests.csproj" />
+  </Folder>
+</Solution>

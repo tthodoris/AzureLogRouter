@@ -1,0 +1,19 @@
+{
+  "version": "2.0",
+  "extensions": {
+    "eventHubs": {
+      "maxEventBatchSize": 128,
+      "minEventBatchSize": 1,
+      "prefetchCount": 256,
+      "batchCheckpointFrequency": 1,
+      "initialOffsetOptions": { "type": "fromStart" }
+    }
+  },
+  "logging": {
+    "logLevel": {
+      "default": "Information",
+      "Azure.Core": "Warning",
+      "System.Net.Http.HttpClient": "Warning"
+    }
+  }
+}

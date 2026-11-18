@@ -1,0 +1,60 @@
+{
+  "source": {
+    "subscriptionId": "09677c47-33bc-4220-953d-207ebb36097e",
+    "workspaceResourceId": "/subscriptions/09677c47-33bc-4220-953d-207ebb36097e/resourceGroups/security/providers/Microsoft.OperationalInsights/workspaces/Sentinellaws01",
+    "eventHubNamespace": "ehlr-law-test-b0525cd5.servicebus.windows.net",
+    "eventHubName": "central-logs",
+    "consumerGroup": "log-router"
+  },
+  "maxParallelDeliveries": 8,
+  "routes": [
+    {
+      "name": "signin-ttsironis-to-law1",
+      "originTenantId": "74566a7f-3d73-4abd-bebb-ece0c2e1ad4f",
+      "target": {
+        "subscriptionId": "48f1a68c-cd48-430c-af15-b176f81fc22d",
+        "workspaceResourceId": "/subscriptions/48f1a68c-cd48-430c-af15-b176f81fc22d/resourceGroups/rg-law-test/providers/Microsoft.OperationalInsights/workspaces/law1",
+        "dcrResourceId": "/subscriptions/48f1a68c-cd48-430c-af15-b176f81fc22d/resourceGroups/rg-law-test/providers/Microsoft.Insights/dataCollectionRules/dcr-signin-router-law1",
+        "dcrImmutableId": "dcr-00000000000000000000000000000001",
+        "ingestionEndpoint": "https://REPLACE-ME.ingest.monitor.azure.com/"
+      },
+      "tables": [
+        {
+          "sourceTable": "SigninLogs",
+          "targetTable": "FwdSigninLogs_CL",
+          "streamName": "Custom-FwdSigninLogs_CL",
+          "filter": {
+            "field": "UserPrincipalName",
+            "op": "contains",
+            "value": "ttsironis",
+            "ignoreCase": true
+          }
+        }
+      ]
+    },
+    {
+      "name": "signin-gdouka-to-law2",
+      "originTenantId": "74566a7f-3d73-4abd-bebb-ece0c2e1ad4f",
+      "target": {
+        "subscriptionId": "48f1a68c-cd48-430c-af15-b176f81fc22d",
+        "workspaceResourceId": "/subscriptions/48f1a68c-cd48-430c-af15-b176f81fc22d/resourceGroups/rg-law-test/providers/Microsoft.OperationalInsights/workspaces/law2",
+        "dcrResourceId": "/subscriptions/48f1a68c-cd48-430c-af15-b176f81fc22d/resourceGroups/rg-law-test/providers/Microsoft.Insights/dataCollectionRules/dcr-signin-router-law2",
+        "dcrImmutableId": "dcr-00000000000000000000000000000002",
+        "ingestionEndpoint": "https://REPLACE-ME.ingest.monitor.azure.com/"
+      },
+      "tables": [
+        {
+          "sourceTable": "SigninLogs",
+          "targetTable": "FwdSigninLogs_CL",
+          "streamName": "Custom-FwdSigninLogs_CL",
+          "filter": {
+            "field": "UserPrincipalName",
+            "op": "contains",
+            "value": "gdouka",
+            "ignoreCase": true
+          }
+        }
+      ]
+    }
+  ]
+}
