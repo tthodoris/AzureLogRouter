@@ -13,6 +13,13 @@ param consumerGroup string = 'log-router'
 @description('Reuse this existing dedicated namespace in the router resource group instead of creating one.')
 param existingEventHubNamespaceName string = ''
 
+param existingVnetId string = ''
+param existingFunctionSubnetId string = ''
+param existingPrivateEndpointSubnetId string = ''
+param vnetCidr string = '10.250.0.0/24'
+param functionSubnetCidr string = '10.250.0.0/27'
+param privateEndpointSubnetCidr string = '10.250.0.32/28'
+
 @minValue(1)
 @maxValue(40)
 param throughputUnits int = 12
@@ -97,7 +104,7 @@ resource createdEventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' = i
     isAutoInflateEnabled: true
     maximumThroughputUnits: 40
     minimumTlsVersion: '1.2'
-    publicNetworkAccess: 'Enabled'
+    publicNetworkAccess: 'Disabled'
     // Azure Monitor workspace export uses shared-access authorization; the router uses managed identity.
     disableLocalAuth: false
   }
@@ -105,6 +112,121 @@ resource createdEventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' = i
 
 resource eventHubNamespace 'Microsoft.EventHub/namespaces@2024-01-01' existing = {
   name: namespaceName
+}
+
+resource namespaceFirewall 'Microsoft.EventHub/namespaces/networkRuleSets@2024-01-01' = {
+  parent: eventHubNamespace
+  name: 'default'
+  properties: {
+    publicNetworkAccess: 'Disabled'
+    defaultAction: 'Deny'
+    trustedServiceAccessEnabled: true
+    ipRules: []
+    virtualNetworkRules: []
+  }
+  dependsOn: [createdEventHubNamespace]
+}
+
+var createNetwork = empty(existingVnetId)
+var routerVnetResourceId = createNetwork ? routerNetwork!.id : existingVnetId
+var functionSubnetId = createNetwork ? functionsSubnet!.id : existingFunctionSubnetId
+var endpointSubnetId = createNetwork ? endpointSubnet!.id : existingPrivateEndpointSubnetId
+
+resource egressIp 'Microsoft.Network/publicIPAddresses@2024-05-01' = if (createNetwork) {
+  name: 'pip-lr-${suffix}'
+  location: location
+  sku: { name: 'Standard' }
+  properties: { publicIPAllocationMethod: 'Static' }
+}
+
+resource egress 'Microsoft.Network/natGateways@2024-05-01' = if (createNetwork) {
+  name: 'nat-lr-${suffix}'
+  location: location
+  sku: { name: 'Standard' }
+  properties: { publicIpAddresses: [{ id: egressIp!.id }] }
+}
+
+resource routerNetwork 'Microsoft.Network/virtualNetworks@2024-05-01' = if (createNetwork) {
+  name: 'vnet-lr-${suffix}'
+  location: location
+  properties: {
+    addressSpace: { addressPrefixes: [vnetCidr] }
+  }
+}
+
+resource functionsSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (createNetwork) {
+  parent: routerNetwork
+  name: 'functions'
+  properties: {
+    addressPrefix: functionSubnetCidr
+    defaultOutboundAccess: false
+    natGateway: { id: egress!.id }
+    serviceEndpoints: [{ service: 'Microsoft.Storage' }]
+    delegations: [
+      {
+        name: 'flex-consumption'
+        properties: { serviceName: 'Microsoft.App/environments' }
+      }
+    ]
+  }
+}
+
+resource endpointSubnet 'Microsoft.Network/virtualNetworks/subnets@2024-05-01' = if (createNetwork) {
+  parent: routerNetwork
+  name: 'private-endpoints'
+  properties: {
+    addressPrefix: privateEndpointSubnetCidr
+    privateEndpointNetworkPolicies: 'Disabled'
+  }
+  dependsOn: [functionsSubnet]
+}
+
+var privateZoneNames = ['privatelink.servicebus.windows.net', 'privatelink.azurewebsites.net']
+
+resource privateDns 'Microsoft.Network/privateDnsZones@2024-06-01' = [for zoneName in privateZoneNames: {
+  name: zoneName
+  location: 'global'
+}]
+
+resource dnsLinks 'Microsoft.Network/privateDnsZones/virtualNetworkLinks@2024-06-01' = [for (zoneName, i) in privateZoneNames: {
+  parent: privateDns[i]
+  name: 'router-${suffix}'
+  location: 'global'
+  properties: {
+    registrationEnabled: false
+    virtualNetwork: { id: routerVnetResourceId }
+  }
+}]
+
+resource hubEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = {
+  name: 'pe-eventhubs-${suffix}'
+  location: location
+  properties: {
+    subnet: { id: endpointSubnetId }
+    privateLinkServiceConnections: [
+      {
+        name: 'eventhubs'
+        properties: {
+          privateLinkServiceId: eventHubNamespace.id
+          groupIds: ['namespace']
+        }
+      }
+    ]
+  }
+  dependsOn: [namespaceFirewall]
+}
+
+resource hubDnsGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = {
+  parent: hubEndpoint
+  name: 'default'
+  properties: {
+    privateDnsZoneConfigs: [
+      {
+        name: 'eventhubs'
+        properties: { privateDnsZoneId: privateDns[0].id }
+      }
+    ]
+  }
 }
 
 resource eventHub 'Microsoft.EventHub/namespaces/eventhubs@2024-01-01' = {
@@ -153,6 +275,8 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
   }
   properties: {
     serverFarmId: plan.id
+    publicNetworkAccess: 'Disabled'
+    virtualNetworkSubnetId: functionSubnetId
     httpsOnly: true
     siteConfig: { minTlsVersion: '1.2' }
     functionAppConfig: {
@@ -176,7 +300,37 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
       }
     }
   }
-  dependsOn: [blobAccess, hubAccess]
+  dependsOn: [blobAccess, hubAccess, hubDnsGroup, dnsLinks[0]]
+}
+
+resource functionEndpoint 'Microsoft.Network/privateEndpoints@2024-05-01' = {
+  name: 'pe-function-${suffix}'
+  location: location
+  properties: {
+    subnet: { id: endpointSubnetId }
+    privateLinkServiceConnections: [
+      {
+        name: 'function'
+        properties: {
+          privateLinkServiceId: functionApp.id
+          groupIds: ['sites']
+        }
+      }
+    ]
+  }
+}
+
+resource functionDnsGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups@2024-05-01' = {
+  parent: functionEndpoint
+  name: 'default'
+  properties: {
+    privateDnsZoneConfigs: [
+      {
+        name: 'function'
+        properties: { privateDnsZoneId: privateDns[1].id }
+      }
+    ]
+  }
 }
 
 resource appSettings 'Microsoft.Web/sites/config@2024-04-01' = {
@@ -204,3 +358,5 @@ output clientId string = identity.properties.clientId
 output storageAccountName string = storage.name
 output eventHubNamespaceResourceId string = eventHubNamespace.id
 output eventHubNamespaceHost string = '${eventHubNamespace.name}.servicebus.windows.net'
+output routerVnetId string = routerVnetResourceId
+output functionScmHost string = first(filter(functionApp.properties.enabledHostNames!, host => contains(host, '.scm.')))

@@ -2,7 +2,7 @@
 param(
     [string] $DotnetExecutable = (Get-Command dotnet -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source,
     [string] $NuGetSource,
-    [ValidateSet('Existing', 'New', 'TableMismatch', 'TenantMismatch', 'RegionMismatch', 'HubMismatch')]
+    [ValidateSet('Existing', 'New', 'InfrastructureOnly', 'JumpHost', 'JumpHostDirect', 'ReuseNetwork', 'CustomCidrs', 'OverlappingCidrs', 'InvalidJumpHostIp', 'ScmBlocked', 'TableMismatch', 'TenantMismatch', 'RegionMismatch', 'HubMismatch')]
     [string] $Scenario = 'Existing'
 )
 
@@ -10,10 +10,13 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = Split-Path $PSScriptRoot -Parent
 $calls = [System.Collections.Generic.List[string[]]]::new()
-$testState = @{ PackageChecked = $false; ExportChecked = $false; DestinationsChecked = 0 }
+$testState = @{ CentralChecked = $false; LockedDown = $false; ScmChecked = $false; PackageChecked = $false; ExportChecked = $false; DestinationsChecked = 0 }
 $sourceSubscription = '11111111-1111-1111-1111-111111111111'
 $routerSubscription = if ($Scenario -eq 'New') { $sourceSubscription } else { '44444444-4444-4444-4444-444444444444' }
 $namespaceName = if ($Scenario -eq 'New') { 'smoke' } else { 'existing-smoke' }
+$vaultId = "/subscriptions/$routerSubscription/resourceGroups/rg-router/providers/Microsoft.KeyVault/vaults/smoke-vault"
+$existingVnetId = "/subscriptions/$routerSubscription/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/shared"
+$directPassword = [guid]::NewGuid().ToString()
 
 function TableSchema([string] $Name) {
     $field = switch ($Name) {
@@ -55,13 +58,64 @@ function Check([bool] $Condition, [string] $Message) {
 
 function dotnet { & $DotnetExecutable @args }
 
+function Invoke-WebRequest {
+    Check ($testState.CentralChecked) 'SCM probe must follow private infrastructure deployment'
+    Check ($args -contains 'https://function-smoke.scm.azurewebsites.net/api/deployments') 'Probe the SCM hostname returned by the template'
+    Check ($args -contains '-NoProxy') 'Probe the private endpoint directly'
+    $testState.ScmChecked = $true
+    @{ StatusCode = if ($Scenario -eq 'ScmBlocked') { 403 } else { 401 } }
+}
+
+function Read-Host {
+    Check ($Scenario -eq 'JumpHostDirect' -and $args -contains '-AsSecureString') 'Direct password is prompted securely'
+    ConvertTo-SecureString $directPassword -AsPlainText -Force
+}
+
+function Invoke-RestMethod {
+    Check ($Scenario -eq 'JumpHostDirect' -and $testState.CentralChecked) 'Direct deployment follows VNet creation'
+    Check ((Arg $args '-Method') -eq 'Put' -and (Arg $args '-Authentication') -eq 'OAuth') 'Use authenticated ARM deployment'
+    Check ((Arg $args '-Uri') -eq "https://management.azure.com/subscriptions/$routerSubscription/resourceGroups/rg-router/providers/Microsoft.Resources/deployments/smoke-router-jump?api-version=2022-09-01") 'Send password only to the scoped ARM endpoint'
+    $request = (Arg $args '-Body') | ConvertFrom-Json -Depth 100
+    Check ($request.properties.mode -eq 'Incremental' -and $request.properties.template.parameters.adminPassword.type -eq 'secureString') 'Use a secure template parameter'
+    Check ($request.properties.parameters.adminUsername.value -eq 'deployadmin' -and
+        $request.properties.parameters.adminPassword.value -ceq $directPassword) 'Submit the prompted credentials'
+    $testState.JumpHostChecked = $true
+}
+
 # The deployment script resolves this local function instead of the real Azure CLI.
 # Unsupported commands fail closed so this test never provisions Azure resources.
 function az {
     $a = [string[]]$args
+    Check (!$a.Contains($directPassword)) 'Never pass the direct password to Azure CLI'
     $calls.Add($a)
     $result = @{}
-    if (($a[0..1] -join ' ') -eq 'resource show') {
+    if (($a[0..1] -join ' ') -eq 'bicep build') {
+        Check ($Scenario -eq 'JumpHostDirect' -and (Split-Path (Arg $a '--file') -Leaf) -eq 'jump-host.bicep') 'Compile the jump host template'
+        $result = @{ parameters = @{ adminPassword = @{ type = 'secureString' } } }
+    }
+    elseif (($a[0..1] -join ' ') -eq 'account get-access-token') {
+        Check ($Scenario -eq 'JumpHostDirect' -and (Arg $a '--subscription') -eq $routerSubscription) 'Get ARM token in router subscription'
+        $result = @{ accessToken = 'mock-arm-token' }
+    }
+    elseif (($a[0..2] -join ' ') -in @('deployment group wait', 'deployment group show')) {
+        Check ($Scenario -eq 'JumpHostDirect' -and $testState.JumpHostChecked -and (Arg $a '--name') -eq 'smoke-router-jump') 'Wait for and read the private-network jump host deployment'
+        $result = @{ properties = @{ outputs = @{
+            publicIpAddress = @{ value = '203.0.113.9' }
+            administrator = @{ value = 'deployadmin' }
+        } } }
+    }
+    elseif (($a[0..2] -join ' ') -eq 'network vnet show') {
+        Check ($Scenario -eq 'ReuseNetwork' -and (Arg $a '--resource-group') -eq 'rg-network') 'Look up the selected VNet across resource groups'
+        $result = @{
+            id = $existingVnetId; location = 'westeurope'
+            subnets = @(
+                @{ name = 'integration'; id = "$existingVnetId/subnets/integration"; delegations = @(@{ serviceName = 'Microsoft.App/environments' }) }
+                @{ name = 'endpoints'; id = "$existingVnetId/subnets/endpoints" }
+                @{ name = 'jump'; id = "$existingVnetId/subnets/jump"; delegations = @() }
+            )
+        }
+    }
+    elseif (($a[0..1] -join ' ') -eq 'resource show') {
         $result = @{ id = (Arg $a '--ids'); location = 'westeurope' }
         if ($result.id -match '/tables/([^/]+)$') {
             $result.properties = @{ schema = TableSchema $Matches[1] }
@@ -101,9 +155,17 @@ function az {
         Check ((Arg $a '--resource-group') -eq 'rg-router') 'Existing namespace group'
         $result = @{
             location = if ($Scenario -eq 'RegionMismatch') { 'eastus' } else { 'westeurope' }
-            provisioningState = 'Succeeded'; sku = @{ name = 'Standard' }
-            disableLocalAuth = $false; publicNetworkAccess = 'Enabled'
+            provisioningState = 'Succeeded'; sku = @{ name = 'Premium' }
+            disableLocalAuth = $false
+            publicNetworkAccess = if ($Scenario -eq 'ScmBlocked') { 'Disabled' } else { 'Enabled' }
         }
+    }
+    elseif (($a[0..2] -join ' ') -eq 'eventhubs namespace update') {
+        Check ($testState.CentralChecked) 'Disable namespace public access through ARM after central deployment'
+        Check ((Arg $a '--public-network-access') -eq 'Disabled') 'Reused namespace must not remain public'
+        Check ((Arg $a '--name') -eq $namespaceName) 'Only lock down the selected namespace'
+        $testState.LockedDown = $true
+        $result = @{ publicNetworkAccess = 'Disabled' }
     }
     elseif (($a[0..2] -join ' ') -eq 'eventhubs eventhub list') {
         $result = @()
@@ -124,15 +186,48 @@ function az {
                 Check ((Arg $a '--subscription') -eq $routerSubscription) 'Router deployment subscription'
                 $expectedNamespace = if ($Scenario -eq 'New') { '' } else { 'existing-smoke' }
                 Check ($p.existingEventHubNamespaceName.value -eq $expectedNamespace) 'Correct namespace create/reuse choice'
+                if ($Scenario -eq 'ReuseNetwork') {
+                    Check ($p.existingVnetId.value -eq $existingVnetId -and
+                        $p.existingFunctionSubnetId.value -eq "$existingVnetId/subnets/integration" -and
+                        $p.existingPrivateEndpointSubnetId.value -eq "$existingVnetId/subnets/endpoints" -and
+                        !$p.PSObject.Properties['vnetCidr']) 'Use resolved subnet IDs without sending new network settings'
+                }
+                if ($Scenario -eq 'CustomCidrs') {
+                    Check ($p.vnetCidr.value -eq '10.70.0.0/24' -and $p.functionSubnetCidr.value -eq '10.70.0.0/27' -and
+                        $p.privateEndpointSubnetCidr.value -eq '10.70.0.32/28') 'Pass all custom network ranges'
+                }
+                $testState.CentralChecked = $true
                 $result = @{ properties = @{ outputs = @{
                     principalId = @{ value = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' }
                     functionAppName = @{ value = 'function-smoke' }
                     storageAccountName = @{ value = 'storagesmoke' }
                     eventHubNamespaceHost = @{ value = "$namespaceName.servicebus.windows.net" }
                     eventHubNamespaceResourceId = @{ value = "/subscriptions/$routerSubscription/resourceGroups/rg-router/providers/Microsoft.EventHub/namespaces/$namespaceName" }
+                    functionScmHost = @{ value = 'function-smoke.scm.azurewebsites.net' }
+                    routerVnetId = @{ value = if ($Scenario -eq 'ReuseNetwork') { $existingVnetId } else { "/subscriptions/$routerSubscription/resourceGroups/rg-router/providers/Microsoft.Network/virtualNetworks/vnet-smoke" } }
+                } } }
+            }
+            'jump-host.bicep' {
+                Check ($Scenario -in @('JumpHost', 'ReuseNetwork', 'CustomCidrs') -and $testState.CentralChecked) 'Jump host is opt-in and follows router network setup'
+                $expectedVnetName = if ($Scenario -eq 'ReuseNetwork') { 'shared' } else { 'vnet-smoke' }
+                Check ($p.routerVnetName.value -eq $expectedVnetName -and $p.rdpSourceIp.value -eq '203.0.113.8') 'Use the selected VNet and operator address'
+                if ($Scenario -eq 'ReuseNetwork') {
+                    Check ($p.existingJumpHostSubnetId.value -eq "$existingVnetId/subnets/jump") 'Use existing jump-host subnet'
+                }
+                if ($Scenario -eq 'CustomCidrs') {
+                    Check ($p.jumpHostSubnetCidr.value -eq '10.70.0.64/27') 'Pass the custom jump-host range'
+                }
+                Check ($p.adminPassword.reference.keyVault.id -eq $vaultId -and
+                    $p.adminPassword.reference.secretName -eq 'jump-admin' -and
+                    !$p.adminPassword.PSObject.Properties['value']) 'Pass a vault reference and no plaintext password'
+                $testState.JumpHostChecked = $true
+                $result = @{ properties = @{ outputs = @{
+                    publicIpAddress = @{ value = '203.0.113.9' }
+                    administrator = @{ value = 'routeradmin' }
                 } } }
             }
             'destination.bicep' {
+                Check $testState.ScmChecked 'No destination changes before private SCM reachability is checked'
                 $subscription = Arg $a '--subscription'
                 $group = Arg $a '--resource-group'
                 $policies = @($p.tablePolicies.value)
@@ -186,6 +281,7 @@ function az {
         }
     }
     elseif (($a[0..4] -join ' ') -eq 'functionapp deployment source config-zip --subscription') {
+        Check ($testState.ScmChecked -and ($Scenario -eq 'New' -or $testState.LockedDown)) 'Package deployment must follow private network setup'
         Check ((Arg $a '--subscription') -eq $routerSubscription) 'Function ZIP subscription'
         $zip = [System.IO.Compression.ZipFile]::OpenRead((Arg $a '--src'))
         try {
@@ -220,16 +316,41 @@ $parameters = @{
     NamePrefix = 'smoke-router'
 }
 if ($NuGetSource) { $parameters.NuGetSource = $NuGetSource }
+if ($Scenario -in @('InfrastructureOnly', 'JumpHost', 'JumpHostDirect', 'ReuseNetwork', 'CustomCidrs', 'OverlappingCidrs', 'InvalidJumpHostIp')) { $parameters.InfrastructureOnly = $true }
+if ($Scenario -eq 'JumpHostDirect') {
+    $parameters.JumpHostAdminUsername = 'deployadmin'
+    $parameters.JumpHostRdpSourceIp = '203.0.113.8'
+}
+if ($Scenario -in @('JumpHost', 'ReuseNetwork', 'CustomCidrs', 'InvalidJumpHostIp')) {
+    $parameters.JumpHostPasswordVaultId = $vaultId
+    $parameters.JumpHostPasswordSecretName = 'jump-admin'
+    $parameters.JumpHostRdpSourceIp = if ($Scenario -eq 'InvalidJumpHostIp') { '0.0.0.0/0' } else { '203.0.113.8' }
+}
+if ($Scenario -eq 'ReuseNetwork') {
+    $parameters.ExistingVnetId = $existingVnetId
+    $parameters.ExistingFunctionSubnetName = 'integration'
+    $parameters.ExistingPrivateEndpointSubnetName = 'endpoints'
+    $parameters.ExistingJumpHostSubnetName = 'jump'
+}
+if ($Scenario -eq 'CustomCidrs') {
+    $parameters.VnetCidr = '10.70.0.0/24'
+    $parameters.FunctionSubnetCidr = '10.70.0.0/27'
+    $parameters.PrivateEndpointSubnetCidr = '10.70.0.32/28'
+    $parameters.JumpHostSubnetCidr = '10.70.0.64/27'
+}
+if ($Scenario -eq 'OverlappingCidrs') { $parameters.PrivateEndpointSubnetCidr = '10.250.0.16/28' }
 if ($Scenario -ne 'New') {
     $parameters.RouterSubscriptionId = $routerSubscription
     $parameters.ExistingEventHubNamespaceName = $namespaceName
 }
-if ($Scenario -in @('TableMismatch', 'TenantMismatch', 'RegionMismatch', 'HubMismatch')) {
+if ($Scenario -in @('TableMismatch', 'TenantMismatch', 'RegionMismatch', 'HubMismatch', 'OverlappingCidrs', 'InvalidJumpHostIp')) {
     $expectedError = switch ($Scenario) {
         'TenantMismatch' { 'router subscription must be in the same Entra tenant' }
         'RegionMismatch' { 'namespace must be in the source workspace region' }
         'HubMismatch' { 'existing Event Hub does not have' }
         'TableMismatch' { 'does not match source' }
+        'InvalidJumpHostIp' { 'must be one IPv4 address' }
+        'OverlappingCidrs' { 'overlaps FunctionSubnetCidr' }
     }
     try {
         & (Join-Path $root 'scripts\Deploy.ps1') @parameters
@@ -242,7 +363,31 @@ if ($Scenario -in @('TableMismatch', 'TenantMismatch', 'RegionMismatch', 'HubMis
     Write-Host "Deployment smoke passed: $Scenario rejected before Azure changes."
     return
 }
+if ($Scenario -eq 'ScmBlocked') {
+    try {
+        & (Join-Path $root 'scripts\Deploy.ps1') @parameters
+        throw 'Deployment unexpectedly succeeded.'
+    }
+    catch {
+        Check ($_.Exception.Message -like '*private Function deployment endpoint*HTTP 403*') "Unexpected SCM error: $($_.Exception.Message)"
+    }
+    Check ($testState.ScmChecked -and !$testState.LockedDown -and $testState.DestinationsChecked -eq 0 -and
+        !$testState.PackageChecked -and !$testState.ExportChecked) 'SCM failure must stop before destination provisioning, upload, or export'
+    Write-Host 'Deployment smoke passed: blocked SCM stopped deployment.'
+    return
+}
 & (Join-Path $root 'scripts\Deploy.ps1') @parameters
+if ($Scenario -in @('InfrastructureOnly', 'JumpHost', 'JumpHostDirect', 'ReuseNetwork', 'CustomCidrs')) {
+    Check ($testState.CentralChecked -and $testState.LockedDown -and !$testState.ScmChecked -and $testState.DestinationsChecked -eq 0 -and
+        !$testState.PackageChecked -and !$testState.ExportChecked) 'Infrastructure-only must lock down central resources without deploying code, destinations, or export'
+    Check ($testState.ContainsKey('JumpHostChecked') -eq ($Scenario -ne 'InfrastructureOnly')) 'Only provision a jump host when requested'
+    if ($Scenario -eq 'JumpHostDirect') {
+        $writtenParameters = Get-ChildItem (Join-Path $root 'artifacts') -Filter '*.parameters.json' -File
+        Check (@($writtenParameters | Select-String -SimpleMatch -Pattern $directPassword).Count -eq 0) 'Never write the direct password to an artifact'
+    }
+    Write-Host "Deployment smoke passed: $Scenario."
+    return
+}
 Check $testState.ExportChecked 'Export deployment must complete'
 Check $testState.PackageChecked 'Application package must be verified'
 Check ($calls.Count -ge 10) 'Expected command sequence must execute'

@@ -95,7 +95,7 @@ The router caps original records at 60,000 UTF-8 bytes to avoid transport-field 
 
 ## Build and test
 
-Prerequisites: .NET 10 SDK. Deployment additionally needs PowerShell 7, Azure CLI with Bicep, and an authenticated Azure session.
+Prerequisites: .NET 10 SDK. Deployment additionally needs PowerShell 7, Azure CLI with Bicep, and an authenticated Azure session. On Linux, Bash is also required; the Linux entry point uses PowerShell 7 to run the cross-platform deployment orchestrator.
 
 ```powershell
 dotnet test .\tests\LogRouter.Tests\LogRouter.Tests.csproj
@@ -130,12 +130,12 @@ The trigger normalizes Event Hubs metadata from raw AMQP annotations because the
 
 ## Deploy
 
-The central and target Log Analytics workspaces must **already exist**. This implementation targets Azure public cloud, same-tenant subscriptions, and public authenticated endpoints. Private Link/VNet integration and cross-tenant delivery require additional infrastructure and are not implemented.
+The central and target Log Analytics workspaces must **already exist**. This deployment targets same-tenant subscriptions in Azure public cloud. It disables public network access on the Function App and Event Hubs namespace. The Function consumes events over Private Link using managed identity. The namespace still allows the trusted Microsoft services exception required by Log Analytics workspace export, which does not use the router's private endpoint. Storage and destination Logs Ingestion API access remain authenticated and are not made private by this deployment.
 
 1. Copy the configuration to a working file and verify or replace source/target subscription IDs, workspace ARM IDs, origin IDs, DCR ARM IDs, table names, and filters. Keep syntactically valid placeholder DCR immutable IDs/endpoints until deployment replaces them.
 2. Use **dedicated DCR names**: deployment manages the whole DCR. Choose custom destination names using `tables[].targetTable` and matching `streamName`. Existing tables are reused only if their non-generated schema matches; their settings and schema are never updated.
 3. Use one DCR per target workspace, in that workspace's resource group. DCR region is set to the workspace region automatically.
-4. Register the relevant providers in the subscriptions that contain the resources: `Microsoft.Insights`, `Microsoft.OperationalInsights`, `Microsoft.EventHub`, `Microsoft.Storage`, `Microsoft.ManagedIdentity`, `Microsoft.Web`. The central workspace region must support Flex Consumption and .NET 10.
+4. Register `Microsoft.Insights`, `Microsoft.OperationalInsights`, `Microsoft.EventHub`, `Microsoft.Storage`, `Microsoft.ManagedIdentity`, and `Microsoft.Web` in the relevant subscriptions, plus `Microsoft.Network` and `Microsoft.App` in the router subscription. The central workspace region must support Flex Consumption, VNet integration, and .NET 10.
 5. The deployer needs read access to all workspaces and their table schemas, rights to create missing tables and deploy resources in their resource groups, role-assignment write permission at the relevant scopes, permission to create the central data export and deploy Function code, and Azure Monitor's required Event Hubs export permissions on the selected namespace.
 6. Start with a canary table/subscription policy before enabling full production volume.
 
@@ -147,6 +147,78 @@ az login
   -NamePrefix central-router `
   -ThroughputUnits 12
 ```
+
+On Linux, install .NET 10 SDK, PowerShell 7, Azure CLI, and Azure CLI Bicep; then sign in with `az login`. From the project directory, the prerequisite checker can verify the local tools and Azure CLI login:
+
+```bash
+bash scripts/check-linux-prerequisites.sh
+```
+
+If your Linux machine isn't connected to the router network yet, deploy central infrastructure first:
+
+```bash
+bash scripts/deploy-linux.sh \
+  --configuration ./my-routing.json \
+  --resource-group rg-central-log-router \
+  --name-prefix central-router \
+  --infrastructure-only
+```
+
+Then run the same command **without `--infrastructure-only`** from a Linux machine that can reach the Function App's private SCM endpoint. The PowerShell equivalent is `-InfrastructureOnly`. The first run creates central resources and disables the trigger but does not publish code or change destination resources or the workspace export rule. On an existing router, schedule these steps in a maintenance window: the trigger is disabled until the full deployment succeeds and public clients lose access.
+
+### Networking options
+
+Omit networking options to create a VNet with the current defaults. To override the IPv4 ranges for a **new VNet**, append options like these:
+
+```bash
+  --vnet-cidr '10.70.0.0/24' \
+  --function-subnet-cidr '10.70.0.0/27' \
+  --private-endpoint-subnet-cidr '10.70.0.32/28' \
+  --jump-host-subnet-cidr '10.70.0.64/27'
+```
+
+In PowerShell, use `-VnetCidr`, `-FunctionSubnetCidr`, `-PrivateEndpointSubnetCidr`, and `-JumpHostSubnetCidr`. The defaults use the same subnet sizes and offsets under `10.250.0.0/24`. The jump-host subnet is created only when the VM is requested. Subnets must be inside the VNet and must not overlap. The new Function subnet is delegated to `Microsoft.App/environments` and gets a NAT Gateway and a public IP **for outbound connections only**; these resources incur charges.
+
+To **reuse an existing VNet**, omit the CIDR options and append:
+
+```bash
+  --existing-vnet-id '<vnet-arm-resource-id>' \
+  --existing-function-subnet-name 'snet-functions' \
+  --existing-private-endpoint-subnet-name 'snet-private-endpoints'
+```
+
+Add `--existing-jump-host-subnet-name 'snet-jump'` if creating the optional VM. In PowerShell, use `-ExistingVnetId`, `-ExistingFunctionSubnetName`, `-ExistingPrivateEndpointSubnetName`, and `-ExistingJumpHostSubnetName`. The VNet may be in another resource group, but must be in the router subscription and source workspace region. Use distinct subnets: the Function subnet must already be delegated to `Microsoft.App/environments` with sufficient capacity (use `/27` or larger for one app), and the private endpoint and jump-host subnets must not be delegated. The deployment does not change the existing VNet address space, subnet configurations, or outbound routing. Ensure the Function subnet can reach its storage and Logs Ingestion API; ensure existing security rules allow the required private traffic and, if applicable, the VM's restricted RDP.
+
+Use the same VNet and subnet settings in both deployment stages and on redeployments. The template links `privatelink.azurewebsites.net` (app and SCM) and `privatelink.servicebus.windows.net` (Event Hubs) to the chosen VNet. If it already uses private DNS zones for either suffix, coordinate with the network owner before deployment to avoid conflicting zone links. Connect the deployment machine to that network and verify the printed SCM hostname resolves to the Function's private endpoint IP. The script checks HTTPS reachability before uploading and never opens public access.
+
+Optional arguments are `--subscription-id`, `--existing-eventhub-namespace`, `--throughput-units`, and `--nuget-source`. Configuration paths may be absolute or relative to the project directory. The script does not install software or change the Azure CLI's selected subscription.
+
+### Optional Windows jump host
+
+To create a public Windows Server 2022 jump host in the router VNet, register `Microsoft.Compute` in the router subscription. For username/password authentication without Key Vault, append these options to the `--infrastructure-only` command above:
+
+```bash
+  --jump-host-rdp-source-ip '<your-public-IPv4-address>' \
+  --jump-host-admin-username 'routeradmin'
+```
+
+The script prompts for the Windows password without echoing it, and sends it to Azure Resource Manager over HTTPS as a secure deployment parameter. It does not write the password to a file or pass it on a command line. In PowerShell, use `-JumpHostRdpSourceIp` and `-JumpHostAdminUsername`. For automation, pass a `SecureString` to `-JumpHostAdminPassword` from an existing PowerShell session instead of using the prompt. Do not mix a direct password with the Key Vault options.
+
+Alternatively, append the following options to use an existing Key Vault:
+
+```bash
+  --jump-host-rdp-source-ip '<your-public-IPv4-address>' \
+  --jump-host-password-vault-id '<key-vault-ARM-resource-id>' \
+  --jump-host-password-secret-name '<password-secret-name>'
+```
+
+In PowerShell, use `-JumpHostRdpSourceIp`, `-JumpHostPasswordVaultId`, and `-JumpHostPasswordSecretName`. Put a strong Windows administrator password in that existing Key Vault before deployment, enable **Azure Resource Manager for template deployment** on the vault, and grant the deployer `Microsoft.KeyVault/vaults/deploy/action` there. The parameter file contains a Key Vault reference, not the password. Use only a vault approved for this access.
+
+The VM has a static public IP and allows inbound TCP 3389 only from your specified IPv4 address (`/32`). It uses the jump-host subnet described above and can resolve the private Function SCM and Event Hubs names. RDP to the printed address with the selected username (default `routeradmin` in Key Vault mode), then install PowerShell 7, .NET 10 SDK, Azure CLI with Bicep, and copy or clone the project and routing configuration onto the VM. Sign in with `az login` and rerun the PowerShell deployment command from the VM without `-InfrastructureOnly` or the jump-host RDP and credential options. Keep the same router configuration, resource group, name prefix, subscription, network settings, and Event Hubs namespace selection. The Function App and Event Hubs remain private.
+
+Omitting the jump-host options on later runs leaves the existing VM in place. The VM, public IP, and OS disk can incur charges; remove the jump-host resources when no longer needed.
+
+### Namespace and deployment scope
 
 If needed, supply `-NuGetSource` with the mirror URL shown above. The script explicitly scopes every Azure command to its subscription; it does not change your default subscription.
 
@@ -173,13 +245,13 @@ For the separate synthetic test workspace, use `-ConfigurationPath .\src\LogRout
 
 The sender needs the Monitoring Metrics Publisher role on `dcr-synthetic-signins`. Records created before the export rule is active are not backfilled. The test workspace and DCR are dedicated test resources, not copies of production Sentinel or its native sign-in data. Verify export and destination queries after deployment; synthetic table behavior does not prove that the native `SigninLogs` export format is identical.
 
-The existing namespace must be in the selected router resource group and the central workspace region, be ready and Standard tier, permit public access, and have local authorization enabled. Its namespace settings and throughput are **not changed**; `-ThroughputUnits` applies only when creating a new namespace. The Event Hub named in the routing configuration and its consumer group are managed by the deployment. If that Event Hub already exists, it must have 32 partitions and 7-day retention; use a dedicated namespace and Event Hub, not resources shared by another application. If `-ExistingEventHubNamespaceName` is omitted, the template creates a new dedicated namespace in the chosen router group and writes its hostname into the deployed configuration. The `eventHubNamespace` value in the input JSON does not select an existing namespace by itself.
+The existing namespace must be in the selected router resource group and the central workspace region, be ready and Standard or Premium tier, and have local authorization enabled. **Use a dedicated namespace:** the deployment replaces its firewall rules with a default deny and the trusted-services exception, creates a private endpoint, and disables public access. It does not change the SKU or throughput; `-ThroughputUnits` applies only when creating a new Standard namespace. The deployer needs permissions to change namespace networking, create private endpoints and DNS, and join the Function integration subnet. The Event Hub and consumer group are managed by the deployment; if the Event Hub already exists, it must have 32 partitions and 7-day retention. The `eventHubNamespace` value in the input JSON does not select an existing namespace by itself.
 
 Deployment sequence:
 
 1. Publish locally and validate routing configuration before making Azure changes.
 2. Check workspace access, matching resource IDs, shared DCR selection, same-tenant subscriptions, source schemas, and compatibility of existing target tables.
-3. Create router resources in the selected subscription and group, in the central workspace's region: a new or explicitly selected existing Standard Event Hubs namespace, a 32-partition Event Hub with seven-day retention, dedicated consumer group, user-assigned managed identity, keyless blob storage, quarantine/deployment containers, and .NET 10 Flex Consumption Function.
+3. Configure the private router infrastructure in the central workspace region and check that the deployment machine can reach the Function's private SCM endpoint.
 4. Keep the trigger disabled while creating missing spoke tables from source schemas, provisioning each Direct-kind DCR, and assigning scoped Monitoring Metrics Publisher roles. Existing tables are excluded from table deployment.
 5. Add DCR transformations that enforce source-workspace, source-table, and allowed subscription or tenant origin boundaries, then project the original fields into the destination schema. Per-table JSON business filters still run centrally.
 6. Write resolved routing configuration to `artifacts\routing.deployed.json`, include it in the application ZIP, deploy code, and enable the trigger.
