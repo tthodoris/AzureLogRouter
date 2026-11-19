@@ -14,6 +14,7 @@ Usage:
     [--subscription-id ID] \
     [--existing-eventhub-namespace NAME] \
     [--infrastructure-only] \
+    [--function-access Private|Public] \
     [--existing-vnet-id ID --existing-function-subnet-name NAME --existing-private-endpoint-subnet-name NAME] \
     [--existing-jump-host-subnet-name NAME] \
     [--vnet-cidr CIDR --function-subnet-cidr CIDR --private-endpoint-subnet-cidr CIDR --jump-host-subnet-cidr CIDR] \
@@ -58,6 +59,11 @@ while (($#)); do
     --infrastructure-only)
       infrastructure_only=true
       shift
+      ;;
+    --function-access)
+      (($# >= 2)) || { usage >&2; exit 2; }
+      args+=('-FunctionAccess' "$2")
+      shift 2
       ;;
     --existing-vnet-id|--existing-function-subnet-name|--existing-private-endpoint-subnet-name|--existing-jump-host-subnet-name|--vnet-cidr|--function-subnet-cidr|--private-endpoint-subnet-cidr|--jump-host-subnet-cidr)
       (($# >= 2)) || { usage >&2; exit 2; }

@@ -6,6 +6,7 @@ param(
     [string] $RouterSubscriptionId = '',
     [string] $ExistingEventHubNamespaceName = '',
     [switch] $InfrastructureOnly,
+    [ValidateSet('Private', 'Public')][string] $FunctionAccess = 'Private',
     [string] $ExistingVnetId,
     [string] $ExistingFunctionSubnetName,
     [string] $ExistingPrivateEndpointSubnetName,
@@ -263,6 +264,24 @@ try {
         }
         if ($ExistingJumpHostSubnetName) { $existingJumpHostSubnetId = Get-ExistingSubnet $vnet $ExistingJumpHostSubnetName $false }
     }
+    $newEventHubNamespaceName = ''
+    if (-not $ExistingEventHubNamespaceName) {
+        if ($config.source.eventHubNamespace -notmatch '\A([a-z][a-z0-9-]{4,48}[a-z0-9])\.servicebus\.windows\.net\z') {
+            throw 'source.eventHubNamespace must be <namespace>.servicebus.windows.net with a valid Azure Event Hubs namespace name (6-50 characters).'
+        }
+        $newEventHubNamespaceName = $Matches[1].ToLowerInvariant()
+        $expectedId = "/subscriptions/$RouterSubscriptionId/resourceGroups/$RouterResourceGroup/providers/Microsoft.EventHub/namespaces/$newEventHubNamespaceName"
+        $matchingNamespaces = @(Invoke-AzJson @('resource', 'list', '--subscription', $RouterSubscriptionId,
+            '--resource-type', 'Microsoft.EventHub/namespaces', '--name', $newEventHubNamespaceName) |
+            Where-Object name -eq $newEventHubNamespaceName)
+        if ($matchingNamespaces | Where-Object id -ne $expectedId) {
+            throw "Event Hubs namespace '$newEventHubNamespaceName' already exists outside the router resource group. Choose another namespace name."
+        }
+        if ($matchingNamespaces.Count -gt 0) {
+            $ExistingEventHubNamespaceName = $newEventHubNamespaceName
+            $newEventHubNamespaceName = ''
+        }
+    }
     if ($ExistingEventHubNamespaceName) {
         $namespace = Invoke-AzJson @('eventhubs', 'namespace', 'show', '--subscription', $RouterSubscriptionId,
             '--resource-group', $RouterResourceGroup, '--name', $ExistingEventHubNamespaceName)
@@ -352,7 +371,9 @@ try {
         location = $sourceWorkspace.location; namePrefix = $NamePrefix
         eventHubName = $config.source.eventHubName; consumerGroup = $config.source.consumerGroup
         existingEventHubNamespaceName = $ExistingEventHubNamespaceName
+        newEventHubNamespaceName = $newEventHubNamespaceName
         throughputUnits = $ThroughputUnits; routerEnabled = $false
+        functionPublicAccess = $FunctionAccess -eq 'Public'
     } + $networkParameters)
     $central = (Invoke-AzJson @('deployment', 'group', 'create', '--subscription', $RouterSubscriptionId,
         '--resource-group', $RouterResourceGroup, '--name', "$NamePrefix-central",
@@ -366,6 +387,12 @@ try {
         }
     }
     $scmHost = $central.functionScmHost.value
+    $scmDescription = if ($FunctionAccess -eq 'Private') { 'private Function deployment endpoint' } else { 'Function deployment endpoint' }
+    $scmHelp = if ($FunctionAccess -eq 'Private') {
+        'Check private DNS, endpoint approval and VNet connectivity.'
+    } else {
+        'Check SCM access restrictions and DNS. If the hostname resolves privately, use a machine with VNet connectivity.'
+    }
     if ($createJumpHost) {
         $routerVnet = ResourceParts $central.routerVnetId.value 'Microsoft.Network/virtualNetworks'
         $jumpParameters = @{
@@ -395,21 +422,17 @@ try {
         }
         Write-Host "Windows jump host: $($jump.publicIpAddress.value) (RDP as $($jump.administrator.value) from $JumpHostRdpSourceIp)."
     }
-    if ($InfrastructureOnly) {
-        Write-Host "Private router infrastructure is ready. VNet: $($central.routerVnetId.value)"
-        Write-Host "Connect the deployment machine to that network and configure private DNS for $scmHost. Then rerun without -InfrastructureOnly."
-        return
-    }
-
-    try {
-        $scm = Invoke-WebRequest -Method Get -Uri "https://$scmHost/api/deployments" -NoProxy `
-            -TimeoutSec 20 -SkipHttpErrorCheck
-    }
-    catch {
-        throw "Cannot reach private Function deployment endpoint $scmHost. Check private DNS, endpoint approval and VNet connectivity: $($_.Exception.Message)"
-    }
-    if ([int]$scm.StatusCode -notin @(200, 401)) {
-        throw "Private Function deployment endpoint $scmHost returned HTTP $([int]$scm.StatusCode). Check private DNS, endpoint approval and VNet connectivity."
+    if (-not $InfrastructureOnly) {
+        try {
+            $scm = Invoke-WebRequest -Method Get -Uri "https://$scmHost/api/deployments" -NoProxy `
+                -TimeoutSec 20 -SkipHttpErrorCheck
+        }
+        catch {
+            throw "Cannot reach ${scmDescription} ${scmHost}. $scmHelp $($_.Exception.Message)"
+        }
+        if ([int]$scm.StatusCode -notin @(200, 401)) {
+            throw "The $scmDescription $scmHost returned HTTP $([int]$scm.StatusCode). $scmHelp"
+        }
     }
     $config.source.eventHubNamespace = $central.eventHubNamespaceHost.value
 
@@ -455,6 +478,16 @@ try {
 
     $generatedConfig = Join-Path $artifacts 'routing.deployed.json'
     $config | ConvertTo-Json -Depth 64 | Set-Content $generatedConfig -Encoding utf8
+    if ($InfrastructureOnly) {
+        Write-Host "Private router infrastructure and destination DCRs are ready. VNet: $($central.routerVnetId.value)"
+        Write-Host "Generated configuration: $generatedConfig"
+        if ($FunctionAccess -eq 'Private') {
+            Write-Host "Connect the deployment machine to that network and configure private DNS for $scmHost."
+        }
+        Write-Host "Function access: $FunctionAccess. Rerun with the same access mode and without -InfrastructureOnly to upload code, enable the trigger, and configure workspace export."
+        return
+    }
+
     Invoke-Dotnet @($dll, '--validate-config', $generatedConfig)
     Copy-Item $generatedConfig (Join-Path $publish 'routing.json') -Force
     $zip = Join-Path $artifacts ("function-" + [guid]::NewGuid().ToString('N') + '.zip')

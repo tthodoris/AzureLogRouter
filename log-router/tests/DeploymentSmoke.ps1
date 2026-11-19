@@ -2,7 +2,7 @@
 param(
     [string] $DotnetExecutable = (Get-Command dotnet -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source,
     [string] $NuGetSource,
-    [ValidateSet('Existing', 'New', 'InfrastructureOnly', 'JumpHost', 'JumpHostDirect', 'ReuseNetwork', 'CustomCidrs', 'OverlappingCidrs', 'InvalidJumpHostIp', 'ScmBlocked', 'TableMismatch', 'TenantMismatch', 'RegionMismatch', 'HubMismatch')]
+    [ValidateSet('Existing', 'PublicFunction', 'New', 'ConfiguredNamespaceExists', 'NamespaceConflict', 'InfrastructureOnly', 'JumpHost', 'JumpHostDirect', 'ReuseNetwork', 'CustomCidrs', 'OverlappingCidrs', 'InvalidJumpHostIp', 'ScmBlocked', 'TableMismatch', 'TenantMismatch', 'RegionMismatch', 'HubMismatch')]
     [string] $Scenario = 'Existing'
 )
 
@@ -11,9 +11,12 @@ Set-StrictMode -Version Latest
 $root = Split-Path $PSScriptRoot -Parent
 $calls = [System.Collections.Generic.List[string[]]]::new()
 $testState = @{ CentralChecked = $false; LockedDown = $false; ScmChecked = $false; PackageChecked = $false; ExportChecked = $false; DestinationsChecked = 0 }
+$infrastructureOnly = $Scenario -in @('InfrastructureOnly', 'JumpHost', 'JumpHostDirect', 'ReuseNetwork', 'CustomCidrs', 'OverlappingCidrs', 'InvalidJumpHostIp')
 $sourceSubscription = '11111111-1111-1111-1111-111111111111'
 $routerSubscription = if ($Scenario -eq 'New') { $sourceSubscription } else { '44444444-4444-4444-4444-444444444444' }
-$namespaceName = if ($Scenario -eq 'New') { 'smoke' } else { 'existing-smoke' }
+$configuredNamespaceName = 'replace-me'
+$useConfiguredNamespace = $Scenario -in @('New', 'ConfiguredNamespaceExists', 'NamespaceConflict')
+$namespaceName = if ($useConfiguredNamespace) { $configuredNamespaceName } else { 'existing-smoke' }
 $vaultId = "/subscriptions/$routerSubscription/resourceGroups/rg-router/providers/Microsoft.KeyVault/vaults/smoke-vault"
 $existingVnetId = "/subscriptions/$routerSubscription/resourceGroups/rg-network/providers/Microsoft.Network/virtualNetworks/shared"
 $directPassword = [guid]::NewGuid().ToString()
@@ -115,6 +118,16 @@ function az {
             )
         }
     }
+    elseif (($a[0..1] -join ' ') -eq 'resource list') {
+        Check ($useConfiguredNamespace -and (Arg $a '--name') -eq $configuredNamespaceName -and
+            (Arg $a '--resource-type') -eq 'Microsoft.EventHub/namespaces' -and
+            (Arg $a '--subscription') -eq $routerSubscription) 'Discover the configured namespace in the router subscription'
+        $result = @()
+        if ($Scenario -ne 'New') {
+            $group = if ($Scenario -eq 'NamespaceConflict') { 'rg-other' } else { 'rg-router' }
+            $result += @{ name = $namespaceName; id = "/subscriptions/$routerSubscription/resourceGroups/$group/providers/Microsoft.EventHub/namespaces/$namespaceName" }
+        }
+    }
     elseif (($a[0..1] -join ' ') -eq 'resource show') {
         $result = @{ id = (Arg $a '--ids'); location = 'westeurope' }
         if ($result.id -match '/tables/([^/]+)$') {
@@ -153,6 +166,7 @@ function az {
     elseif (($a[0..2] -join ' ') -eq 'eventhubs namespace show') {
         Check ((Arg $a '--subscription') -eq $routerSubscription) 'Existing namespace subscription'
         Check ((Arg $a '--resource-group') -eq 'rg-router') 'Existing namespace group'
+        Check ((Arg $a '--name') -eq $namespaceName) 'Inspect only the expected namespace'
         $result = @{
             location = if ($Scenario -eq 'RegionMismatch') { 'eastus' } else { 'westeurope' }
             provisioningState = 'Succeeded'; sku = @{ name = 'Premium' }
@@ -183,9 +197,13 @@ function az {
         switch ($template) {
             'central.bicep' {
                 Check (!$p.routerEnabled.value) 'Trigger must be disabled initially'
+                Check ($p.functionPublicAccess.value -is [bool] -and
+                    $p.functionPublicAccess.value -eq ($Scenario -eq 'PublicFunction')) 'Only explicit public Function mode enables inbound public access'
                 Check ((Arg $a '--subscription') -eq $routerSubscription) 'Router deployment subscription'
-                $expectedNamespace = if ($Scenario -eq 'New') { '' } else { 'existing-smoke' }
+                $expectedNamespace = if ($Scenario -eq 'New') { '' } else { $namespaceName }
                 Check ($p.existingEventHubNamespaceName.value -eq $expectedNamespace) 'Correct namespace create/reuse choice'
+                $expectedNewNamespace = if ($Scenario -eq 'New') { $configuredNamespaceName } else { '' }
+                Check ($p.newEventHubNamespaceName.value -ceq $expectedNewNamespace -and $p.eventHubName.value -eq 'central-logs') 'Use the routing hostname for namespace creation without changing the Event Hub name'
                 if ($Scenario -eq 'ReuseNetwork') {
                     Check ($p.existingVnetId.value -eq $existingVnetId -and
                         $p.existingFunctionSubnetId.value -eq "$existingVnetId/subnets/integration" -and
@@ -227,7 +245,7 @@ function az {
                 } } }
             }
             'destination.bicep' {
-                Check $testState.ScmChecked 'No destination changes before private SCM reachability is checked'
+                Check ($testState.CentralChecked -and ($infrastructureOnly -or $testState.ScmChecked)) 'Destinations require central infrastructure; full deploy also requires private SCM reachability'
                 $subscription = Arg $a '--subscription'
                 $group = Arg $a '--resource-group'
                 $policies = @($p.tablePolicies.value)
@@ -316,7 +334,8 @@ $parameters = @{
     NamePrefix = 'smoke-router'
 }
 if ($NuGetSource) { $parameters.NuGetSource = $NuGetSource }
-if ($Scenario -in @('InfrastructureOnly', 'JumpHost', 'JumpHostDirect', 'ReuseNetwork', 'CustomCidrs', 'OverlappingCidrs', 'InvalidJumpHostIp')) { $parameters.InfrastructureOnly = $true }
+if ($Scenario -eq 'PublicFunction') { $parameters.FunctionAccess = 'Public' }
+if ($infrastructureOnly) { $parameters.InfrastructureOnly = $true }
 if ($Scenario -eq 'JumpHostDirect') {
     $parameters.JumpHostAdminUsername = 'deployadmin'
     $parameters.JumpHostRdpSourceIp = '203.0.113.8'
@@ -341,13 +360,16 @@ if ($Scenario -eq 'CustomCidrs') {
 if ($Scenario -eq 'OverlappingCidrs') { $parameters.PrivateEndpointSubnetCidr = '10.250.0.16/28' }
 if ($Scenario -ne 'New') {
     $parameters.RouterSubscriptionId = $routerSubscription
+}
+if (-not $useConfiguredNamespace) {
     $parameters.ExistingEventHubNamespaceName = $namespaceName
 }
-if ($Scenario -in @('TableMismatch', 'TenantMismatch', 'RegionMismatch', 'HubMismatch', 'OverlappingCidrs', 'InvalidJumpHostIp')) {
+if ($Scenario -in @('TableMismatch', 'TenantMismatch', 'RegionMismatch', 'HubMismatch', 'NamespaceConflict', 'OverlappingCidrs', 'InvalidJumpHostIp')) {
     $expectedError = switch ($Scenario) {
         'TenantMismatch' { 'router subscription must be in the same Entra tenant' }
         'RegionMismatch' { 'namespace must be in the source workspace region' }
         'HubMismatch' { 'existing Event Hub does not have' }
+        'NamespaceConflict' { 'already exists outside the router resource group' }
         'TableMismatch' { 'does not match source' }
         'InvalidJumpHostIp' { 'must be one IPv4 address' }
         'OverlappingCidrs' { 'overlaps FunctionSubnetCidr' }
@@ -377,9 +399,15 @@ if ($Scenario -eq 'ScmBlocked') {
     return
 }
 & (Join-Path $root 'scripts\Deploy.ps1') @parameters
-if ($Scenario -in @('InfrastructureOnly', 'JumpHost', 'JumpHostDirect', 'ReuseNetwork', 'CustomCidrs')) {
-    Check ($testState.CentralChecked -and $testState.LockedDown -and !$testState.ScmChecked -and $testState.DestinationsChecked -eq 0 -and
-        !$testState.PackageChecked -and !$testState.ExportChecked) 'Infrastructure-only must lock down central resources without deploying code, destinations, or export'
+if ($infrastructureOnly) {
+    Check ($testState.CentralChecked -and $testState.LockedDown -and !$testState.ScmChecked -and $testState.DestinationsChecked -eq 2 -and
+        !$testState.PackageChecked -and !$testState.ExportChecked) 'Infrastructure-only must provision both destinations without accessing SCM, deploying code, or configuring export'
+    $resolved = Get-Content -LiteralPath (Join-Path $root 'artifacts\routing.deployed.json') -Raw | ConvertFrom-Json
+    Check ($resolved.source.eventHubNamespace -eq "$namespaceName.servicebus.windows.net") 'Infrastructure-only must resolve the Event Hubs hostname'
+    foreach ($route in $resolved.routes) {
+        Check ($route.target.ingestionEndpoint -eq 'https://smoke.ingest.monitor.azure.com/' -and
+            $route.target.dcrImmutableId -eq "dcr-$($route.target.subscriptionId.Replace('-', ''))") 'Infrastructure-only must resolve each destination from the DCR deployment outputs'
+    }
     Check ($testState.ContainsKey('JumpHostChecked') -eq ($Scenario -ne 'InfrastructureOnly')) 'Only provision a jump host when requested'
     if ($Scenario -eq 'JumpHostDirect') {
         $writtenParameters = Get-ChildItem (Join-Path $root 'artifacts') -Filter '*.parameters.json' -File

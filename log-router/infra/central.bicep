@@ -12,10 +12,13 @@ param consumerGroup string = 'log-router'
 
 @description('Reuse this existing dedicated namespace in the router resource group instead of creating one.')
 param existingEventHubNamespaceName string = ''
+param newEventHubNamespaceName string
 
 param existingVnetId string = ''
 param existingFunctionSubnetId string = ''
 param existingPrivateEndpointSubnetId string = ''
+@description('Controls Function App inbound public access only; VNet integration and Private Link are configured in either mode.')
+param functionPublicAccess bool = false
 param vnetCidr string = '10.250.0.0/24'
 param functionSubnetCidr string = '10.250.0.0/27'
 param privateEndpointSubnetCidr string = '10.250.0.32/28'
@@ -36,7 +39,7 @@ param retentionDays int = 7
 param routerEnabled bool = false
 
 var suffix = uniqueString(resourceGroup().id, namePrefix)
-var namespaceName = empty(existingEventHubNamespaceName) ? 'ehlr-${suffix}' : existingEventHubNamespaceName
+var namespaceName = empty(existingEventHubNamespaceName) ? newEventHubNamespaceName : existingEventHubNamespaceName
 var blobOwnerRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'b7e6dc6d-f1e8-4753-8033-0f276bb0955b')
 var hubReceiverRole = subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'a638d3c7-ab3a-418d-83e6-5f17a39d4fde')
 
@@ -275,7 +278,7 @@ resource functionApp 'Microsoft.Web/sites@2024-04-01' = {
   }
   properties: {
     serverFarmId: plan.id
-    publicNetworkAccess: 'Disabled'
+    publicNetworkAccess: functionPublicAccess ? 'Enabled' : 'Disabled'
     virtualNetworkSubnetId: functionSubnetId
     httpsOnly: true
     siteConfig: { minTlsVersion: '1.2' }

@@ -2,7 +2,7 @@
   "source": {
     "subscriptionId": "48f1a68c-cd48-430c-af15-b176f81fc22d",
     "workspaceResourceId": "/subscriptions/48f1a68c-cd48-430c-af15-b176f81fc22d/resourceGroups/rg-law-test/providers/Microsoft.OperationalInsights/workspaces/sentinellaws01-test-b0525cd5",
-    "eventHubNamespace": "ehlr-law-test-b0525cd5.servicebus.windows.net",
+    "eventHubNamespace": "ehlr-law-test-aade.servicebus.windows.net",
     "eventHubName": "central-logs",
     "consumerGroup": "log-router"
   },
