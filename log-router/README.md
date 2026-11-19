@@ -263,6 +263,19 @@ For redeployment, archive/remove only the specific `artifacts\publish` staging d
 
 The deployment uses managed identity for Function storage, Event Hubs consumption, quarantine, and cross-subscription ingestion. No account keys or client secrets are embedded. Event Hubs local authorization remains enabled because Azure Monitor workspace export uses shared-access authorization.
 
+### Redeploy only the Function code
+
+From PowerShell 7 on the jump host (or another machine that can reach the private SCM endpoint), sign in with `az login` and run:
+
+```powershell
+.\scripts\Deploy-Function.ps1 `
+  -RouterSubscriptionId '<router-subscription-id>' `
+  -RouterResourceGroup '<router-resource-group>' `
+  -FunctionAppName '<existing-function-app-name>'
+```
+
+The script validates `artifacts\routing.deployed.json`, builds a fresh ZIP under `artifacts`, and uploads it to the existing Function App. You can pass `-ConfigurationPath` to use a different resolved config. An infrastructure-only run does not generate this file; it must contain the actual Event Hubs hostname and destination DCR immutable IDs and ingestion endpoints. The script does not provision infrastructure, update the workspace export rule, or enable a disabled trigger.
+
 ## Failure handling and replay
 
 - HTTP 408, 429, 5xx, network failures, and request timeouts are retried up to four total attempts.
@@ -321,3 +334,22 @@ Acceptance procedure:
 - [Event Hubs trigger](https://learn.microsoft.com/azure/azure-functions/functions-bindings-event-hubs-trigger)
 - [.NET isolated Functions](https://learn.microsoft.com/azure/azure-functions/dotnet-isolated-process-guide)
 - [Flex Consumption infrastructure](https://learn.microsoft.com/azure/azure-functions/functions-infrastructure-as-code)
+
+
+.\scripts\Deploy.ps1 `                  
+ -ConfigurationPath '.\src\LogRouter\routing.synthetic-test.json' `
+ -RouterSubscriptionId '48f1a68c-cd48-430c-af15-b176f81fc22d' `             
+ -RouterResourceGroup 'rg-law-test' ` 
+ -NamePrefix 'signin-aade-router' `                         
+ -ExistingVnetId '/subscriptions/48f1a68c-cd48-430c-af15-b176f81fc22d/resourceGroups/rg-law-test/providers/Microsoft.Network/virtualNetworks/vnet-logrouter-test' `
+ -ExistingFunctionSubnetName snet-functions `
+ -ExistingPrivateEndpointSubnetName snet-pe `
+     -ExistingJumpHostSubnetName 'snet-jh' `
+     -JumpHostRdpSourceIp '150.228.63.211' `
+     -JumpHostAdminUsername 'routeradmin'
+     -InfrastructureOnly
+
+.\scripts\Deploy-Function.ps1 `         
+   -RouterSubscriptionId '48f1a68c-cd48-430c-af15-b176f81fc22d' `
+   -RouterResourceGroup 'rg-law-test' `
+   -FunctionAppName 'func-lr-7vgwgbpg4bo6a'
